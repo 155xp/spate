@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,19 +18,23 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-type result struct{ name, magnet string }
+type result struct {
+	name, size, magnet                             string
+	category, date, source, sourceURL, check, flag string
+	seeds, leechers                                int
+}
 type found struct {
 	rows []result
 	err  error
 }
 type tick time.Time
 type model struct {
-	client        *torrent.Client
-	query, status string
-	rows          []result
-	cursor        int
-	download      *torrent.Torrent
-	last, rate    int64
+	client         *torrent.Client
+	query, status  string
+	rows           []result
+	cursor, height int
+	download       *torrent.Torrent
+	last, rate     int64
 }
 
 var (
@@ -62,8 +68,23 @@ func search(q string) tea.Cmd {
 			if !ok {
 				return true
 			}
-			name := html.UnescapeString(strings.TrimSpace(a.AttrOr("title", a.Text())))
-			rows = append(rows, result{name, magnet})
+			td := tr.Find("td")
+			name := html.UnescapeString(strings.TrimSpace(a.AttrOr("title", td.Eq(1).Text())))
+			seeds, _ := strconv.Atoi(strings.TrimSpace(td.Eq(4).Text()))
+			leechers, _ := strconv.Atoi(strings.TrimSpace(td.Eq(5).Text()))
+			category := strings.Join(strings.Fields(td.Eq(0).Text()), " ")
+			check := tr.Find("[data-bs-original-title]").First().AttrOr("data-bs-original-title", "")
+			flag := ""
+			td.Eq(1).Find(".badge").EachWithBreak(func(_ int, badge *goquery.Selection) bool {
+				flag = strings.TrimSpace(badge.Text())
+				return flag == ""
+			})
+			rows = append(rows, result{
+				name, strings.TrimSpace(td.Eq(2).Text()), magnet,
+				category, strings.TrimSpace(td.Eq(3).Text()), strings.TrimSpace(td.Eq(6).Text()),
+				td.Eq(6).Find("a").First().AttrOr("href", ""), check, flag,
+				seeds, leechers,
+			})
 			return len(rows) < 10
 		})
 		return found{rows: rows}
@@ -76,6 +97,8 @@ func pulse() tea.Cmd {
 }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch x := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = x.Height
 	case tea.KeyMsg:
 		switch x.String() {
 		case "ctrl+c":
@@ -89,6 +112,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down", "j":
 			if m.cursor+1 < len(m.rows) {
 				m.cursor++
+			}
+		case "o":
+			if len(m.rows) > 0 {
+				page, err := url.Parse(m.rows[m.cursor].sourceURL)
+				if err == nil && (page.Scheme == "http" || page.Scheme == "https") {
+					_ = exec.Command("open", page.String()).Start()
+				}
 			}
 		case "enter":
 			if len(m.rows) == 0 && strings.TrimSpace(m.query) != "" {
@@ -169,24 +199,48 @@ func (m model) downloadView() string {
 		bytes(done), dim.Render("of "+bytes(total)), bytes(max(0, m.rate)), peers)
 }
 
+func shorten(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
+func detailView(r result) string {
+	meta := strings.Trim(strings.Join([]string{r.category, r.source, r.date}, "  •  "), "  •")
+	status := r.check
+	if r.flag != "" {
+		status += "  •  ⚠ " + r.flag
+	}
+	return hot.Render("selected") + "\n" + shorten(r.name, 76) + "\n" +
+		dim.Render(meta) + "\n" + dim.Render(status)
+}
+
 func (m model) View() string {
 	var b strings.Builder
 	b.WriteString(hot.Render("spate") + "\n\n")
 	if len(m.rows) == 0 {
 		b.WriteString("  ❯ " + m.query + "█\n\n" + dim.Render("enter search  •  ctrl+c quit"))
 	} else {
-		for i, r := range m.rows {
-			line := fmt.Sprintf(" %2d  %-72.72s ", i+1, r.name)
+		b.WriteString(dim.Render("     NAME                                           SIZE  SEEDS  ↓NOW") + "\n")
+		visible := min(10, max(3, m.height-16))
+		start := max(0, min(m.cursor-visible+1, len(m.rows)-visible))
+		end := min(len(m.rows), start+visible)
+		for i, r := range m.rows[start:end] {
+			i += start
+			line := fmt.Sprintf(" %2d  %-46.46s %8.8s %6d %5d ", i+1, r.name, r.size, r.seeds, r.leechers)
 			if i == m.cursor {
 				line = pick.Render("▍" + line)
 			}
 			b.WriteString(line + "\n")
 		}
-		b.WriteString("\n" + dim.Render("↑↓ choose  •  enter download  •  esc search again"))
+		b.WriteString("\n" + dim.Render("↑↓ choose  •  enter download  •  o description  •  esc search again"))
+		b.WriteString("\n\n" + detailView(m.rows[m.cursor]))
 	}
 	if m.download != nil {
 		b.WriteString("\n\n" + m.downloadView())
-	} else if m.status != "" {
+	} else if m.status != "" && len(m.rows) == 0 {
 		b.WriteString("\n\n" + hot.Render(m.status))
 	}
 	return lipgloss.NewStyle().Margin(2, 4).Render(b.String())
@@ -197,7 +251,7 @@ func main() {
 	dir := filepath.Join(home, "Downloads", "spate")
 	_ = os.MkdirAll(dir, 0755)
 	cfg := torrent.NewDefaultClientConfig()
-	cfg.DataDir, cfg.Seed = dir, false
+	cfg.DataDir, cfg.Seed, cfg.ListenPort = dir, false, 0
 	c, err := torrent.NewClient(cfg)
 	if err != nil {
 		panic(err)
