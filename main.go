@@ -138,6 +138,8 @@ func (m model) searchKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case tea.KeyRunes:
 		m.query += string(k.Runes)
+	case tea.KeySpace:
+		m.query += " "
 	}
 	return m, nil
 }

@@ -8,11 +8,16 @@ import (
 
 func TestSearchAcceptsShortcutLetters(t *testing.T) {
 	m := model{}
-	for _, r := range "jok" {
-		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	keys := []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("jo")},
+		{Type: tea.KeySpace},
+		{Type: tea.KeyRunes, Runes: []rune("k")},
+	}
+	for _, key := range keys {
+		next, _ := m.Update(key)
 		m = next.(model)
 	}
-	if m.query != "jok" {
-		t.Fatalf("query = %q, want jok", m.query)
+	if m.query != "jo k" {
+		t.Fatalf("query = %q, want %q", m.query, "jo k")
 	}
 }
