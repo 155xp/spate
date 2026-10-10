@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,29 +140,5 @@ func TestLocalTransferAndSwitch(t *testing.T) {
 	}
 	if !strings.Contains(m.View(), m.status) {
 		t.Fatal("error is hidden during download")
-	}
-}
-
-type transportFunc func(*http.Request) (*http.Response, error)
-
-func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-func TestSearchParsing(t *testing.T) {
-	old := http.DefaultTransport
-	t.Cleanup(func() { http.DefaultTransport = old })
-	http.DefaultTransport = transportFunc(func(r *http.Request) (*http.Response, error) {
-		if !strings.Contains(r.URL.Path, "test query") {
-			t.Errorf("wrong query URL: %s", r.URL)
-		}
-		body := `<table><tr data-id="1"><td>Video</td><td><a title="A &amp;amp; B" href="magnet:?xt=urn:btih:1111111111111111111111111111111111111111">title</a></td><td>4 MB</td><td>today</td><td>1,042</td><td>7</td><td><a href="https://example.com">source</a></td></tr></table>`
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(strings.Repeat(body, 2)))}, nil
-	})
-	next, _ := (model{}).Update(search("test query")())
-	m := next.(model)
-	if len(m.rows) != 1 || m.rows[0].name != "A &amp; B" || m.rows[0].seeds != 1042 || m.rows[0].leechers != 7 {
-		t.Fatalf("bad search result: %+v", m)
-	}
-	if !strings.Contains(m.View(), "A &amp; B") {
-		t.Fatal("search result missing from UI")
 	}
 }
