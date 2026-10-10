@@ -55,10 +55,7 @@ func search(q string) tea.Cmd {
 		seen := make(map[string]bool)
 		doc.Find("tr[data-id]").EachWithBreak(func(_ int, tr *goquery.Selection) bool {
 			a := tr.Find(`a[href^="magnet:"]`).First()
-			magnet, ok := a.Attr("href")
-			if !ok {
-				return true
-			}
+			magnet := a.AttrOr("href", "")
 			u, err := url.Parse(magnet)
 			if err != nil {
 				return true
@@ -71,13 +68,12 @@ func search(q string) tea.Cmd {
 			td := tr.Find("td")
 			text := func(i int) string { return strings.TrimSpace(td.Eq(i).Text()) }
 			number := func(i int) int { n, _ := strconv.Atoi(strings.ReplaceAll(text(i), ",", "")); return n }
-			flag := strings.TrimSpace(td.Eq(1).Find(".badge").Last().Text())
 			rows = append(rows, result{
 				strings.TrimSpace(a.AttrOr("title", text(1))), text(2), magnet,
 				strings.Join(strings.Fields(text(0)), " "), text(3), text(6),
 				td.Eq(6).Find("a").First().AttrOr("href", ""),
 				tr.Find("[data-bs-original-title]").First().AttrOr("data-bs-original-title", ""),
-				flag, number(4), number(5),
+				strings.TrimSpace(td.Eq(1).Find(".badge").Last().Text()), number(4), number(5),
 			})
 			return len(rows) < 30
 		})
@@ -135,13 +131,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return exec.Command("open", target).Run()
 			}
 		case "enter":
-			t, err := m.client.AddMagnet(m.rows[m.cursor].magnet)
-			if err != nil {
-				m.status = err.Error()
-				break
-			}
 			m.status = ""
-			if t != m.download {
+			if t, err := m.client.AddMagnet(m.rows[m.cursor].magnet); err != nil {
+				m.status = err.Error()
+			} else if t != m.download {
 				if m.download != nil {
 					m.download.Drop()
 				}
@@ -163,8 +156,7 @@ func (m model) searchKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, search(m.query)
 		}
 	case tea.KeyBackspace, tea.KeyDelete:
-		r := []rune(m.query)
-		if len(r) > 0 {
+		if r := []rune(m.query); len(r) > 0 {
 			m.query = string(r[:len(r)-1])
 		}
 	case tea.KeyRunes:
@@ -210,10 +202,8 @@ func run() error {
 		return err
 	}
 	defer c.Close()
-	if _, err = tea.NewProgram(model{client: c, width: 80, height: 24}, tea.WithAltScreen()).Run(); err != nil {
-		return err
-	}
-	return nil
+	_, err = tea.NewProgram(model{client: c, width: 80, height: 24}, tea.WithAltScreen()).Run()
+	return err
 }
 
 func main() {

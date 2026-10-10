@@ -12,42 +12,30 @@ var releaseTokens = regexp.MustCompile(`[^A-Z0-9]+`)
 
 func describeRelease(name string) releaseInfo {
 	tokens := " " + releaseTokens.ReplaceAllString(strings.ToUpper(plain(name)), " ") + " "
-	has := func(words ...string) bool {
-		for _, word := range words {
-			if strings.Contains(tokens, " "+word+" ") {
-				return true
-			}
-		}
-		return false
-	}
 	first := func(options ...string) string {
 		for _, v := range options {
-			if has(v) {
+			if strings.Contains(tokens, " "+v+" ") {
 				return v
 			}
 		}
 		return ""
 	}
+	has := func(words ...string) bool { return first(words...) != "" }
 	r := releaseInfo{resolution: first("2160P", "1080P", "1080I", "720P", "576P", "480P"), note: "Title tags are unverified; source details may clarify this release."}
 	if r.resolution == "" && has("4K", "UHD") {
 		r.resolution = "2160P"
 	}
 	switch {
 	case has("HDCAM", "CAM", "HDTS", "TS", "TELESYNC", "TC", "TELECINE"):
-		r.source = "CAM/TS"
-		r.note = "Camera/early copy: picture and sound may be poor."
+		r.source, r.note = "CAM/TS", "Camera/early copy: picture and sound may be poor."
 	case has("REMUX"):
-		r.source = "REMUX"
-		r.note = "Remux: usually a larger file preserving the source streams."
+		r.source, r.note = "REMUX", "Remux: usually a larger file preserving the source streams."
 	case has("BLURAY", "BLU RAY", "BDRIP", "BRRIP"):
-		r.source = "Blu-ray"
-		r.note = "Disc source; an encode trades some quality for a smaller file."
+		r.source, r.note = "Blu-ray", "Disc source; an encode trades some quality for a smaller file."
 	case has("WEB DL", "WEBDL"):
-		r.source = "WEB-DL"
-		r.note = "Web source: often a useful balance of quality and file size."
+		r.source, r.note = "WEB-DL", "Web source: often a useful balance of quality and file size."
 	case has("WEBRIP"):
-		r.source = "WEBRip"
-		r.note = "Web capture/re-encode; quality depends on the encoding."
+		r.source, r.note = "WEBRip", "Web capture/re-encode; quality depends on the encoding."
 	case has("HDTV", "DVDRIP", "DVD"):
 		r.source = first("HDTV", "DVDRIP", "DVD")
 	}
@@ -59,17 +47,11 @@ func describeRelease(name string) releaseInfo {
 	case has("H264", "H 264", "X264", "AVC"):
 		r.video = "H.264/AVC"
 	}
-	if has("ATMOS") {
-		r.audio = "Atmos"
-	} else {
-		r.audio = first("TRUEHD", "DTS HD", "DTS", "DDP", "DDP5", "EAC3", "AC3", "AAC", "FLAC", "MP3")
-	}
-	if r.audio == "DDP5" {
-		r.audio = "DDP"
-	}
+	r.audio = first("ATMOS", "TRUEHD", "DTS HD", "DTS", "DDP", "DDP5", "EAC3", "AC3", "AAC", "FLAC", "MP3")
+	r.audio = strings.NewReplacer("ATMOS", "Atmos", "DDP5", "DDP").Replace(r.audio)
 	if has("7 1") {
 		r.audio += " 7.1"
-	} else if has("5 1") || has("DDP5 1", "AAC5 1") {
+	} else if has("5 1", "DDP5 1", "AAC5 1") {
 		r.audio += " 5.1"
 	}
 	r.language = first("MULTI", "DUAL", "ENG", "ENGLISH", "FRENCH", "GERMAN", "SPANISH", "HINDI", "JAPANESE", "KOREAN", "ITALIAN", "RUSSIAN")

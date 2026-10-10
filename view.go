@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"strings"
@@ -57,10 +58,9 @@ func eta(remaining int64, speed float64, now time.Time) string {
 		return "ETA unavailable"
 	}
 	d := time.Duration(seconds) * time.Second
-	duration := d.Round(time.Second).String()
+	duration := d.String()
 	if d >= time.Minute {
-		duration = d.Round(time.Minute).String()
-		duration = strings.TrimSuffix(duration, "0s")
+		duration = strings.TrimSuffix(d.Round(time.Minute).String(), "0s")
 	}
 	return fmt.Sprintf("~%s left · finishes ~%s", duration, now.Add(d).Format("15:04"))
 }
@@ -124,31 +124,21 @@ func detailLines(r result, compact bool) []string {
 }
 
 func (m model) View() string {
-	width, height := m.width, m.height
+	width, height := cmp.Or(m.width, 80), cmp.Or(m.height, 24)
 	if width > 0 && width < 3 {
 		return ""
-	}
-	if width == 0 {
-		width = 80
-	}
-	if height == 0 {
-		height = 24
 	}
 	// Leave the last column and row free: writing into them can trigger terminal scrolling.
 	w, h := max(1, width-2), max(1, height-1)
 	lines := []string{hot.Render("spate") + dim.Render("   search · compare · download"), ""}
-	if len(m.rows) > 0 {
-		lines[0] = hot.Render("spate") + dim.Render(fmt.Sprintf("   %d / %d   ", m.cursor+1, len(m.rows))) + ansi.Truncate(plain(m.query), max(1, w-23), "…")
-	}
 	if width < 60 || height < 18 {
 		lines = []string{hot.Render("spate"), "Resize to at least 60 × 18", "Ctrl+C to quit"}
 	} else {
-		help := "enter search · ctrl+c quit"
 		var download []string
 		if m.download != nil {
 			download = append([]string{""}, m.downloadLines(w)...)
 		}
-		footer := []string{"", dim.Render(help)}
+		footer := []string{"", dim.Render("enter search · ctrl+c quit")}
 		if m.status != "" {
 			footer = append(footer, hot.Render(plain(m.status)))
 		}
@@ -160,30 +150,25 @@ func (m model) View() string {
 			}
 			lines = append(lines, "❯ "+query+"█")
 		} else {
+			lines[0] = hot.Render("spate") + dim.Render(fmt.Sprintf("   %d / %d   ", m.cursor+1, len(m.rows))) + ansi.Truncate(plain(m.query), max(1, w-23), "…")
 			footer[1] = dim.Render("↑↓ choose · enter download · o source · / search · q quit")
-			detail := detailLines(m.rows[m.cursor], height < 24)
-			visible := max(1, h-len(lines)-len(detail)-len(download)-len(footer)-2)
+			detail := append([]string{""}, detailLines(m.rows[m.cursor], height < 24)...)
+			visible := max(1, h-len(lines)-len(detail)-len(download)-len(footer)-1)
 			start := max(0, min(m.cursor-visible+1, len(m.rows)-visible))
 			nameWidth := w - 39
 			lines = append(lines, dim.Render(cell("RELEASE", nameWidth)+cell("SIZE", 10)+cell("SEEDS", 7)+"QUALITY / SOURCE"))
 			for i := start; i < min(len(m.rows), start+visible); i++ {
-				r := m.rows[i]
-				marker := "  "
+				r, tags := m.rows[i], describeRelease(m.rows[i].name)
+				line := cell(r.name, nameWidth-2) + cell(r.size, 10) + cell(humanize.Comma(int64(r.seeds)), 7) + strings.TrimSpace(tags.resolution+" "+tags.source)
 				if i == m.cursor {
-					marker = "› "
+					lines = append(lines, pick.Render("› "+line))
+				} else {
+					lines = append(lines, "  "+line)
 				}
-				tags := describeRelease(r.name)
-				line := marker + cell(r.name, nameWidth-2) + cell(r.size, 10) + cell(humanize.Comma(int64(r.seeds)), 7) + strings.TrimSpace(tags.resolution+" "+tags.source)
-				if i == m.cursor {
-					line = pick.Render(line)
-				}
-				lines = append(lines, line)
 			}
-			lines = append(lines, "")
 			lines = append(lines, detail...)
 		}
-		lines = append(lines, download...)
-		lines = append(lines, footer...)
+		lines = append(append(lines, download...), footer...)
 	}
 	lines = lines[:min(len(lines), h)]
 	for i, line := range lines {
