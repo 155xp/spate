@@ -2,209 +2,213 @@ package main
 
 import (
 	"fmt"
-	"html"
+	"io"
+	stdlog "log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	torrentlog "github.com/anacrolix/log"
 	"github.com/anacrolix/torrent"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
-type result struct{ name, magnet string }
-type found struct {
-	rows []result
-	err  error
+type result struct {
+	name, size, magnet, category, date string
+	source, sourceURL, check, flag     string
+	seeds, leechers                    int
 }
-type tick time.Time
 type model struct {
-	client        *torrent.Client
-	query, status string
-	rows          []result
-	cursor        int
-	download      *torrent.Torrent
-	last, rate    int64
+	client                *torrent.Client
+	query, status         string
+	rows                  []result
+	cursor, width, height int
+	download              *torrent.Torrent
+	meter                 transferMeter
+	searching             bool
 }
-
-var (
-	blue = lipgloss.Color("#7DCFFF")
-	dim  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	hot  = lipgloss.NewStyle().Bold(true).Foreground(blue)
-	pick = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E0F2FE")).Background(lipgloss.Color("#1E3A5F"))
-)
 
 func search(q string) tea.Cmd {
 	return func() tea.Msg {
-		u := "https://knaben.org/search/" + url.PathEscape(q) + "/0/1/seeders"
-		req, _ := http.NewRequest("GET", u, nil)
+		req, _ := http.NewRequest("GET", "https://knaben.org/search/"+url.PathEscape(q)+"/0/1/seeders", nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0")
 		resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 		if err != nil {
-			return found{err: err}
+			return err
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return found{err: fmt.Errorf("search returned %s", resp.Status)}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("search returned %s", resp.Status)
 		}
 		doc, err := goquery.NewDocumentFromReader(resp.Body)
 		if err != nil {
-			return found{err: err}
+			return err
 		}
 		var rows []result
+		seen := make(map[string]bool)
 		doc.Find("tr[data-id]").EachWithBreak(func(_ int, tr *goquery.Selection) bool {
 			a := tr.Find(`a[href^="magnet:"]`).First()
-			magnet, ok := a.Attr("href")
-			if !ok {
+			magnet := a.AttrOr("href", "")
+			u, err := url.Parse(magnet)
+			if err != nil {
 				return true
 			}
-			name := html.UnescapeString(strings.TrimSpace(a.AttrOr("title", a.Text())))
-			rows = append(rows, result{name, magnet})
-			return len(rows) < 10
+			hash := strings.ToLower(u.Query().Get("xt"))
+			if hash == "" || seen[hash] {
+				return true
+			}
+			seen[hash] = true
+			td := tr.Find("td")
+			text := func(i int) string { return strings.TrimSpace(td.Eq(i).Text()) }
+			number := func(i int) int { n, _ := strconv.Atoi(strings.ReplaceAll(text(i), ",", "")); return n }
+			rows = append(rows, result{
+				strings.TrimSpace(a.AttrOr("title", text(1))), text(2), magnet,
+				strings.Join(strings.Fields(text(0)), " "), text(3), text(6),
+				td.Eq(6).Find("a").First().AttrOr("href", ""),
+				tr.Find("[data-bs-original-title]").First().AttrOr("data-bs-original-title", ""),
+				strings.TrimSpace(td.Eq(1).Find(".badge").Last().Text()), number(4), number(5),
+			})
+			return len(rows) < 30
 		})
-		return found{rows: rows}
+		return rows
 	}
 }
 
-func (m model) Init() tea.Cmd { return nil }
-func pulse() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg { return tick(t) })
+func (m model) Init() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg { return t })
 }
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch x := msg.(type) {
-	case tea.KeyMsg:
-		switch x.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-		case "esc":
-			m.rows, m.cursor, m.status = nil, 0, ""
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
+	case tea.WindowSizeMsg:
+		m.width, m.height = x.Width, x.Height
+	case []result:
+		m.rows, m.cursor, m.status, m.searching = x, 0, "", false
+		if len(x) == 0 {
+			m.status = "No results. Try a different title or year."
+		}
+	case error:
+		m.status, m.searching = x.Error(), false
+	case time.Time:
+		if t := m.download; t != nil && t.Info() != nil {
+			if m.meter.sampled.IsZero() {
+				t.DownloadAll()
 			}
+			stats := t.Stats()
+			m.meter.sample(x, stats.BytesReadUsefulData.Int64())
+		}
+		return m, m.Init()
+	case tea.KeyMsg:
+		if x.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+		if len(m.rows) == 0 {
+			return m.searchKey(x)
+		}
+		switch x.String() {
+		case "q":
+			return m, tea.Quit
+		case "esc", "/":
+			m.rows, m.cursor, m.query, m.status = nil, 0, "", ""
+		case "up", "k":
+			m.cursor = max(0, m.cursor-1)
 		case "down", "j":
-			if m.cursor+1 < len(m.rows) {
-				m.cursor++
+			m.cursor = min(len(m.rows)-1, m.cursor+1)
+		case "o":
+			target := m.rows[m.cursor].sourceURL
+			return m, func() tea.Msg {
+				u, err := url.Parse(target)
+				if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+					return fmt.Errorf("no source page available")
+				}
+				return exec.Command("open", target).Run()
 			}
 		case "enter":
-			if len(m.rows) == 0 && strings.TrimSpace(m.query) != "" {
-				m.status = "searching…"
-				return m, search(m.query)
-			}
-			if len(m.rows) > 0 {
-				t, err := m.client.AddMagnet(m.rows[m.cursor].magnet)
-				if err != nil {
-					m.status = err.Error()
-				} else {
-					go func() { <-t.GotInfo(); t.DownloadAll() }()
-					m.download, m.last = t, 0
-					m.status = "finding metadata…"
-					return m, pulse()
+			m.status = ""
+			if t, err := m.client.AddMagnet(m.rows[m.cursor].magnet); err != nil {
+				m.status = err.Error()
+			} else if t != m.download {
+				if m.download != nil {
+					m.download.Drop()
 				}
+				m.download, m.meter = t, transferMeter{}
 			}
-		case "backspace":
-			if len(m.rows) == 0 && len(m.query) > 0 {
-				m.query = m.query[:len(m.query)-1]
-			}
-		default:
-			if len(m.rows) == 0 {
-				m.query += string(x.Runes)
-			}
-		}
-	case found:
-		m.rows, m.cursor = x.rows, 0
-		if x.err != nil {
-			m.status = x.err.Error()
-		} else {
-			m.status = fmt.Sprintf("%d results", len(x.rows))
-		}
-	case tick:
-		if m.download != nil {
-			done := m.download.BytesCompleted()
-			m.rate, m.last = (done-m.last)*2, done
-			if m.download.Length() == 0 {
-				m.status = "finding metadata…"
-				return m, pulse()
-			}
-			if m.download.BytesMissing() > 0 {
-				m.status = "downloading"
-				return m, pulse()
-			}
-			m.status, m.rate = "complete", 0
 		}
 	}
 	return m, nil
 }
 
-func bytes(n int64) string {
-	if n < 1024 {
-		return fmt.Sprintf("%d B", n)
+func (m model) searchKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.searching {
+		return m, nil
 	}
-	units := []string{"KB", "MB", "GB", "TB"}
-	v := float64(n)
-	for _, unit := range units {
-		v /= 1024
-		if v < 1024 {
-			return fmt.Sprintf("%.1f %s", v, unit)
+	switch k.Type {
+	case tea.KeyEnter:
+		if strings.TrimSpace(m.query) != "" {
+			m.status, m.searching = "searching…", true
+			return m, search(m.query)
 		}
+	case tea.KeyBackspace, tea.KeyDelete:
+		if r := []rune(m.query); len(r) > 0 {
+			m.query = string(r[:len(r)-1])
+		}
+	case tea.KeyRunes:
+		m.query += string(k.Runes)
+	case tea.KeySpace:
+		m.query += " "
 	}
-	return fmt.Sprintf("%.1f PB", v/1024)
+	return m, nil
 }
 
-func (m model) downloadView() string {
-	total, done := m.download.Length(), m.download.BytesCompleted()
-	if total == 0 {
-		return hot.Render("○ " + m.status)
-	}
-	pct := min(1, float64(done)/float64(total))
-	filled := int(pct * 32)
-	bar := hot.Render(strings.Repeat("▓", filled)) + dim.Render(strings.Repeat("░", 32-filled))
-	peers := m.download.Stats().ActivePeers
-	return fmt.Sprintf("%s\n%s  %5.1f%%\n%s  %s  %s/s  %d peers",
-		hot.Render(m.download.Name()), bar, pct*100,
-		bytes(done), dim.Render("of "+bytes(total)), bytes(max(0, m.rate)), peers)
+func configureLogs(w io.Writer) {
+	handler := torrentlog.DefaultHandler
+	handler.W = w
+	torrentlog.Default.SetHandlers(handler)
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	stdlog.SetOutput(w)
 }
 
-func (m model) View() string {
-	var b strings.Builder
-	b.WriteString(hot.Render("spate") + "\n\n")
-	if len(m.rows) == 0 {
-		b.WriteString("  ❯ " + m.query + "█\n\n" + dim.Render("enter search  •  ctrl+c quit"))
-	} else {
-		for i, r := range m.rows {
-			line := fmt.Sprintf(" %2d  %-72.72s ", i+1, r.name)
-			if i == m.cursor {
-				line = pick.Render("▍" + line)
-			}
-			b.WriteString(line + "\n")
-		}
-		b.WriteString("\n" + dim.Render("↑↓ choose  •  enter download  •  esc search again"))
+func run() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
 	}
-	if m.download != nil {
-		b.WriteString("\n\n" + m.downloadView())
-	} else if m.status != "" {
-		b.WriteString("\n\n" + hot.Render(m.status))
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return err
 	}
-	return lipgloss.NewStyle().Margin(2, 4).Render(b.String())
+	logDir := filepath.Join(cache, "spate")
+	if err := os.MkdirAll(logDir, 0700); err != nil {
+		return err
+	}
+	logFile, err := os.OpenFile(filepath.Join(logDir, "spate.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer logFile.Close()
+	configureLogs(logFile)
+	cfg := torrent.NewDefaultClientConfig()
+	cfg.DataDir = filepath.Join(home, "Downloads", "spate")
+	cfg.Logger, cfg.Slogger = torrentlog.Default, slog.Default()
+	c, err := torrent.NewClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_, err = tea.NewProgram(model{client: c, width: 80, height: 24}, tea.WithAltScreen()).Run()
+	return err
 }
 
 func main() {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, "Downloads", "spate")
-	_ = os.MkdirAll(dir, 0755)
-	cfg := torrent.NewDefaultClientConfig()
-	cfg.DataDir, cfg.Seed = dir, false
-	c, err := torrent.NewClient(cfg)
-	if err != nil {
-		panic(err)
-	}
-	defer c.Close()
-	_, err = tea.NewProgram(model{client: c}, tea.WithAltScreen()).Run()
-	if err != nil {
-		panic(err)
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "spate:", err)
+		os.Exit(1)
 	}
 }
